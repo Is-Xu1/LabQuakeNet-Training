@@ -5,11 +5,13 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 from obspy import read
 from seisbench.models import VariableLengthPhaseNet
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+
 
 # --- Constants ---
 GAUSS_STD = 20
 PHASE_LABELS = {"p": 1, "s": 2, "noise": 0}
-SAMPLING_RATE = 100
+SAMPLING_RATE = 5000000
 CHECKPOINT_PATH = "vlphasenet_checkpoint.pt"
 
 # --- Gaussian Mask ---
@@ -33,77 +35,90 @@ def build_trace_name(mseed_path, trace_index):
     event = os.path.basename(mseed_path).split("_WindowSize")[0]
     return f"p_picks_Exp_{exp}_{run}_{event}_trace{trace_index + 1}"
 
-# --- Dataset Class ---
 class PNoiseDataset(Dataset):
     def __init__(self, root_dir, label_csv):
-        print(f"🔍 Loading dataset from: {root_dir}")
-        self.label_df = pd.read_csv(label_csv)
+        print(f"🔍 Loading picks from: {label_csv}")
+        self.label_df = pd.read_csv(label_csv)  # ✅ define it before using
         print(f"📑 Loaded {len(self.label_df)} pick entries from {label_csv}")
+        
+        self.root_dir = root_dir
         self.mseed_paths = find_mseed_files(root_dir)
-        print(f"📁 Found {len(self.mseed_paths)} .mseed files")
 
-    def __len__(self):
-        return sum(len(read(path)) for path in self.mseed_paths)
+        # Only keep rows where pick is valid
+        self.pick_rows = self.label_df[self.label_df["marked_point"] != -1].reset_index(drop=True)
+        print(f"✅ Using {len(self.pick_rows)} individual picks for training.")
 
-    def __getitem__(self, global_idx):
-        trace_counter = 0
+
+        # Cache all traces into memory
+        self.traces = []  # List of (name_key, waveform, path)
         for path in self.mseed_paths:
             stream = read(path)
-            if global_idx < trace_counter + len(stream):
-                trace_index = global_idx - trace_counter
-                tr = stream[trace_index]
-                full_waveform = tr.data.astype(np.float32)
-                full_length = len(full_waveform)
+            for i, tr in enumerate(stream):
+                name_key = build_trace_name(path, i)
+                waveform = tr.data.astype(np.float32)
+                self.traces.append((name_key, waveform, path))
 
-                print(f"\n📄 File: {os.path.basename(path)}, Trace: {trace_index}")
-                print(f"   → Trace length: {full_length} samples")
+        print(f"✅ Cached {len(self.traces)} traces into memory.")
 
-                name_key = build_trace_name(path, trace_index)
-                picks = self.label_df[self.label_df["Name"] == name_key]
-
-                if len(picks) == 0:
-                    print(f"⚠️  No picks found for {name_key}, using center default.")
-                    center = full_length // 2
-                    min_pick = max_pick = center
-                else:
-                    print(f"✅ {len(picks)} picks found for {name_key}")
-                    pick_indices = picks["marked_point"].astype(int).values
-                    min_pick = np.min(pick_indices)
-                    max_pick = np.max(pick_indices)
-
-                window_size = 50000
-                min_start = max(0, max_pick - window_size + 1)
-                max_start = min(min_pick, full_length - window_size)
-                if max_start < min_start:
-                    start_idx = min_start
-                else:
-                    start_idx = np.random.randint(min_start, max_start + 1)
-
-                end_idx = start_idx + window_size
-                print(f"🪟 Cropping window: {start_idx} to {end_idx} (size: {window_size})")
-
-                waveform = full_waveform[start_idx:end_idx]
-                label_mask = np.zeros((3, window_size), dtype=np.float32)
-
-                for _, row in picks.iterrows():
-                    lbl = "p"  # assume all picks are P-wave
-                    pick_idx = int(row["marked_point"])
-                    if lbl in PHASE_LABELS and 0 <= pick_idx < full_length:
-                        if start_idx <= pick_idx < end_idx:
-                            local_idx = pick_idx - start_idx
-                            mask = apply_gaussian_mask(window_size, local_idx)
-                            label_mask[PHASE_LABELS[lbl]] += mask
+    def __len__(self):
+        return len(self.pick_rows)
 
 
-                label_mask[0] = np.clip(1 - label_mask[1] - label_mask[2], 0, 1)
+    def __getitem__(self, idx):
+        import re
 
-                waveform = torch.tensor(waveform).unsqueeze(0)
-                label = torch.tensor(label_mask)
-                return waveform, label
+        row = self.pick_rows.iloc[idx]
+        name_key = row["Name"]
+        pick_idx = int(row["marked_point"])
 
-            trace_counter += len(stream)
+        # --- Parse name_key using regex ---
+        match = re.match(r"p_picks_Exp_(.+?)_(Run.+)_(EventID_\d+)_trace(\d+)", name_key)
+        if not match:
+            raise ValueError(f"❌ Invalid Name format: {name_key}")
 
-        raise IndexError("Global index out of range")
+        exp = match.group(1)
+        run = match.group(2)
+        event = match.group(3)
+        trace_index = int(match.group(4)) - 1  # 1-based to 0-based
+
+        # --- Get corresponding waveform from cached self.traces ---
+        try:
+            matching_trace = next(t for t in self.traces if t[0] == name_key)
+        except StopIteration:
+            # Pick exists but corresponding waveform is missing
+            return self.__getitem__((idx + 1) % len(self))
+
+        full_waveform = matching_trace[1]
+        full_length = len(full_waveform)
+
+        # --- Crop window around pick ---
+        window_size = 50000
+        half_window = window_size // 2
+        min_start = max(0, pick_idx - half_window)
+        max_start = min(full_length - window_size, pick_idx - int(0.2 * window_size))
+        start_idx = np.random.randint(min_start, max_start + 1) if max_start > min_start else min_start
+        end_idx = start_idx + window_size
+
+        #print(f"\n📄 {name_key} | Pick: {pick_idx} | Crop: {start_idx}–{end_idx}")
+
+        waveform = full_waveform[start_idx:end_idx]
+        label_mask = np.zeros((3, window_size), dtype=np.float32)
+
+        if pick_idx == -1:
+            label_mask[0] = 1.0  # Entire window is noise
+        else:
+            local_idx = pick_idx - start_idx
+            if 0 <= local_idx < window_size:
+                mask = apply_gaussian_mask(window_size, local_idx)
+                label_mask[1] = mask
+            label_mask[0] = np.clip(1 - label_mask[1] - label_mask[2], 0, 1)
+
+        waveform = torch.tensor(waveform).unsqueeze(0)  # [1, T]
+        label = torch.tensor(label_mask)                # [3, T]
+        return waveform, label
+
+
+
 
 # --- Training Function ---
 def train_model(data_dir, label_csv, epochs=5, batch_size=2):
@@ -121,6 +136,9 @@ def train_model(data_dir, label_csv, epochs=5, batch_size=2):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     loss_fn = torch.nn.BCELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', patience=3, factor=0.5
+    )
 
     if os.path.exists(CHECKPOINT_PATH):
         checkpoint = torch.load(CHECKPOINT_PATH)
@@ -133,6 +151,7 @@ def train_model(data_dir, label_csv, epochs=5, batch_size=2):
     for epoch in range(epochs):
         model.train()
         running_loss = 0
+
         for i, (waveform, label) in enumerate(loader):
             output = model(waveform)
             loss = loss_fn(output, label)
@@ -142,18 +161,24 @@ def train_model(data_dir, label_csv, epochs=5, batch_size=2):
             running_loss += loss.item()
             print(f"[Epoch {epoch}] Step {i+1}/{len(loader)} → Loss: {loss.item():.4f}")
 
-        print(f"✅ Epoch {epoch} complete. Avg Loss: {running_loss / len(loader):.4f}")
+        avg_loss = running_loss / len(loader)
+        print(f"✅ Epoch {epoch} complete. Avg Loss: {avg_loss:.4f}")
+
+        # Step the scheduler AFTER each epoch using average loss
+        scheduler.step(avg_loss)
+
         torch.save({
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict()
         }, CHECKPOINT_PATH)
         print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
 
+
 # --- Entry Point ---
 if __name__ == "__main__":
     train_model(
-        data_dir=r"c:\Users\hiriy\Downloads\python\RTX2025\Data",
+        data_dir=r"f:\Data",
         label_csv="p_picks_Data.csv",
-        epochs=1,
-        batch_size=20
+        epochs=200,
+        batch_size=200
     )
