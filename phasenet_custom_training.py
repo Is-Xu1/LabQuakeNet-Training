@@ -20,9 +20,8 @@ def apply_gaussian_mask(length, index, std=GAUSS_STD):
     x = np.arange(length)
     return np.exp(-0.5 * ((x - index) / std) ** 2)
 
-# --- Dataset ---
 class SlidingWindowDataset(Dataset):
-    def __init__(self, root_dir, label_csv, window_size=50000, stride=20000, gauss_std=5,
+    def __init__(self, root_dir, label_csv, window_size=50000, stride=20000, gauss_std=200,
                  amp_scale_range=(0.8, 1.2), noise_std=0.05):
         self.window_size = window_size
         self.stride = stride
@@ -39,7 +38,26 @@ class SlidingWindowDataset(Dataset):
 
         self._cache_and_window_traces(root_dir)
         print(f"✅ Cached {len(self.waveform_cache)} traces into memory.")
+
+        if len(self.data) == 0:
+            raise ValueError("❌ No valid windows generated. Check data folder and labels.")
+
+        # Count pick vs noise windows
+        pick_windows = sum(
+            0 <= pick_idx and start + 2000 <= pick_idx < start + self.window_size - 2000
+            for _, start, pick_idx in self.data
+        )
+        noise_windows = len(self.data) - pick_windows
+        pct_pick = 100 * pick_windows / len(self.data)
+        pct_noise = 100 * noise_windows / len(self.data)
+
         print(f"🪟 Generated {len(self.data)} sliding windows.")
+        print(f"🔵 Pick windows: {pick_windows} ({pct_pick:.2f}%)")
+        print(f"⚪ Noise windows: {noise_windows} ({pct_noise:.2f}%)")
+
+        # Optional: count unique traces with picks
+        unique_picks = set(name for name, _, pick_idx in self.data if pick_idx >= 0)
+        print(f"📍 Unique traces with picks: {len(unique_picks)}")
 
     def _cache_and_window_traces(self, root_dir):
         for root, _, files in os.walk(root_dir):
@@ -60,14 +78,20 @@ class SlidingWindowDataset(Dataset):
     def _build_name(self, path, trace_index):
         parts = path.split(os.sep)
         exp = next(p for p in parts if p.startswith("Exp_")).replace("Exp_", "")
-        run = next((p for p in parts if p.startswith("Run") or "Run" in p), "")
+        run = next((p for p in parts if p.startswith("Run")), "RunX")
         event = os.path.basename(path).split("_WindowSize")[0]
         return f"p_picks_Exp_{exp}_{run}_{event}_trace{trace_index + 1}"
 
     def _generate_windows(self, name, waveform, pick_idx):
         L = len(waveform)
         for start in range(0, L - self.window_size + 1, self.stride):
-            self.data.append((name, start, pick_idx))
+            if 0 <= pick_idx < L:
+                # Only include if pick is not too close to edges
+                if start + 2000 <= pick_idx < start + self.window_size - 2000:
+                    self.data.append((name, start, pick_idx))
+            else:
+                # No pick in trace: safe to add as noise window
+                self.data.append((name, start, pick_idx))
 
     def __len__(self):
         return len(self.data)
@@ -86,14 +110,21 @@ class SlidingWindowDataset(Dataset):
         window += noise.astype(np.float32)
 
         label = np.zeros((2, self.window_size), dtype=np.float32)
-        if 0 <= pick_idx < len(waveform) and start <= pick_idx < start + self.window_size:
+
+        if 0 <= pick_idx < len(waveform) and start + 2000 <= pick_idx < start + self.window_size - 2000:
             local_idx = pick_idx - start
             label[1] = apply_gaussian_mask(self.window_size, local_idx, self.gauss_std)
-        label[0] = np.clip(1 - label[1], 0, 1)
+            label[0] = np.clip(1 - label[1], 0, 1)
+        else:
+            # Forcefully assign full noise label
+            label[0] = np.ones(self.window_size, dtype=np.float32)
+            label[1] = np.zeros(self.window_size, dtype=np.float32)
 
         waveform_tensor = torch.tensor(window).unsqueeze(0)
         label_tensor = torch.tensor(label)
         return waveform_tensor, label_tensor
+
+
 
 # --- Loss ---
 class PhaseNetLoss(torch.nn.Module):
