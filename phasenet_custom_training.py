@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 from obspy import read
 from seisbench.models import VariableLengthPhaseNet
 
+# --- Constants ---
 SAMPLING_RATE = 5000000
 PHASE_LABELS = {"noise": 0, "p": 1}
 torch.manual_seed(42)
@@ -37,10 +38,7 @@ class SlidingWindowDataset(Dataset):
         if len(self.data) == 0:
             raise ValueError("❌ No valid windows generated. Check data folder and labels.")
 
-        pick_windows = sum(
-            0 <= pick_idx and start + 2000 <= pick_idx < start + self.window_size - 2000
-            for _, start, pick_idx in self.data
-        )
+        pick_windows = sum(pick_idx >= 0 for _, _, pick_idx in self.data)
         noise_windows = len(self.data) - pick_windows
 
         print(f"🪟 Generated {len(self.data)} sliding windows.")
@@ -53,21 +51,22 @@ class SlidingWindowDataset(Dataset):
             for root, _, files in os.walk(root_dir)
             for f in files if f.endswith(".mseed")
         ]
+        discarded = 0
         for path in mseed_paths:
             try:
                 stream = read(path)
                 for i, tr in enumerate(stream):
                     name = self._build_name(path, i)
-                    if name in self.label_dict:
-                        waveform = tr.data.astype(np.float32)
-                        if len(waveform) < self.window_size:
-                            pad_len = self.window_size - len(waveform)
-                            waveform = np.concatenate([waveform, np.zeros(pad_len, dtype=np.float32)])
-                        self.waveform_cache[name] = waveform
-                        pick_idx = self.label_dict[name]
-                        self._generate_windows(name, waveform, pick_idx)
+                    waveform = tr.data.astype(np.float32)
+                    if len(waveform) < self.window_size:
+                        pad_len = self.window_size - len(waveform)
+                        waveform = np.concatenate([waveform, np.zeros(pad_len, dtype=np.float32)])
+                    self.waveform_cache[name] = waveform
+                    pick_idx = self.label_dict.get(name, -1)  # -1 if no pick
+                    discarded += self._generate_windows(name, waveform, pick_idx)
             except Exception as e:
                 print(f"⚠️ Skipped {path}: {e}")
+        print(f"❌ Discarded {discarded} windows with edge picks.")
 
     def _build_name(self, path, trace_index):
         parts = path.split(os.sep)
@@ -78,11 +77,20 @@ class SlidingWindowDataset(Dataset):
 
     def _generate_windows(self, name, waveform, pick_idx):
         L = len(waveform)
+        discarded = 0
         for start in range(0, L - self.window_size + 1, self.stride):
-            if 0 <= pick_idx < L and start + 2000 <= pick_idx < start + self.window_size - 2000:
-                self.data.append((name, start, pick_idx))
+            # Check if pick is inside this window
+            if start <= pick_idx < start + self.window_size:
+                if start + 2000 <= pick_idx < start + self.window_size - 2000:
+                    self.data.append((name, start, pick_idx))  # good pick window
+                else:
+                    discarded += 1  # pick is near edge → discard
+            elif pick_idx == -1:
+                self.data.append((name, start, -1))  # no pick at all → noise window
             else:
-                self.data.append((name, start, -1))
+                self.data.append((name, start, -1))  # pick exists, but outside this window → noise window
+        return discarded
+
 
     def __len__(self):
         return len(self.data)
@@ -100,9 +108,12 @@ class SlidingWindowDataset(Dataset):
         scale = np.random.uniform(*self.amp_scale_range)
         window *= scale
 
+        # Normalize
+        window = (window - window.mean()) / (window.std() + 1e-6)
+
         # Label creation
         label = np.zeros((2, self.window_size), dtype=np.float32)
-        if 0 <= pick_idx < len(waveform) and start + 2000 <= pick_idx < start + self.window_size - 2000:
+        if pick_idx >= 0 and start + 5000 <= pick_idx < start + self.window_size - 5000:
             local_idx = pick_idx - start
             label[1] = apply_gaussian_mask(self.window_size, local_idx, self.gauss_std)
             label[0] = np.clip(1 - label[1], 0, 1)
@@ -135,7 +146,7 @@ def train_model(data_dir, label_csv, checkpoint_path, log_csv, window_size, gaus
         root_dir=data_dir,
         label_csv=label_csv,
         window_size=window_size,
-        stride=30000,
+        stride=20000,
         gauss_std=gauss_std,
         amp_scale_range=(0.8, 1.2)
     )
@@ -196,11 +207,18 @@ def train_model(data_dir, label_csv, checkpoint_path, log_csv, window_size, gaus
         pd.DataFrame(log).to_csv(log_csv, index=False)
 
 if __name__ == "__main__":
-    configs = [
-        {"checkpoint": "checkpoint_50000w100g_training.pt", "log": "log_50000w_100g_training.csv", "labels": "p_picks_training.csv", "window_size": 50000, "gauss_std": 100},
-        {"checkpoint": "checkpoint_60000w75g_training1.pt", "log": "log_60000w_75g_training.csv", "labels": "p_picks_training.csv", "window_size": 60000, "gauss_std": 75},
-        {"checkpoint": "checkpoint_50000w90g_training1.pt", "log": "log_50000w_90g_training1.csv", "labels": "p_picks_training.csv", "window_size": 50000, "gauss_std": 90}
-    ]
+    WINDOWSIZE = [40000,30000]
+    GAUSS_STD = [100]
+    configs = []
+    for w, g in zip(WINDOWSIZE, GAUSS_STD):
+        config = {
+            "checkpoint": f"{w}w{g}gAN.pt",
+            "log": f"log_{w}w{g}gAN.csv",
+            "labels": "p_picks_training.csv",
+            "window_size": w,
+            "gauss_std": g
+        }
+        configs.append(config)
 
     for config in configs:
         print(f"\n🚀 Starting training for {config['checkpoint']}...\n")
